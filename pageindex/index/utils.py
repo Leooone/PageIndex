@@ -50,11 +50,12 @@ def llm_log(model: str, messages: list, response: str = "",
             if error:
                 f.write(f"[{now}] ERROR attempt={attempt} elapsed={elapsed:.1f}s {error}\n")
             else:
-                preview = str(messages[-1].get("content",""))[:150].replace("\n"," ") if messages else ""
-                f.write(f"[{now}] REQUEST attempt={attempt} model=... elapsed={elapsed:.1f}s\n")
-                f.write(f"         {preview}\n")
+                prompt_preview = str(messages[-1].get("content",""))[:500].replace("\n"," ") if messages else ""
+                resp_preview = response[:500].replace(chr(10)," ")
+                f.write(f"[{now}] REQUEST attempt={attempt} model={model} elapsed={elapsed:.1f}s prompt={sum(len(str(m.get('content',''))) for m in messages)}chars\n")
+                f.write(f"         {prompt_preview}\n")
                 f.write(f"[{now}] RESPONSE attempt={attempt} elapsed={elapsed:.1f}s ({len(response)} chars)\n")
-                f.write(f"         {response[:200].replace(chr(10),' ')}\n")
+                f.write(f"         {resp_preview}\n")
     except Exception:
         pass
 
