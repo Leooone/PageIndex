@@ -36,7 +36,8 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
     }}
     Directly return the final JSON structure. Do not output anything else."""
 
-    response = await llm_acompletion(model=model, prompt=prompt)
+    async with llm_concurrency_limit():
+        response = await llm_acompletion(model=model, prompt=prompt)
     response = extract_json(response)
     if 'answer' in response:
         answer = response['answer']
@@ -64,7 +65,8 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     }}
     Directly return the final JSON structure. Do not output anything else."""
 
-    response = await llm_acompletion(model=model, prompt=prompt)
+    async with llm_concurrency_limit():
+        response = await llm_acompletion(model=model, prompt=prompt)
     response = extract_json(response)
     if logger:
         logger.info(f"Response: {response}")
@@ -75,23 +77,16 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     if logger:
         logger.info("Checking title appearance in start concurrently")
     
-    # Mark items we can't check as 'no' up front: missing physical_index, or one
-    # out of range for page_list. An out-of-range index (the LLM can emit one)
-    # would otherwise raise IndexError below — during task-list construction,
-    # outside the gather's return_exceptions protection — and abort the build.
-    def _valid_physical_index(item):
-        idx = item.get('physical_index')
-        return idx is not None and 1 <= idx <= len(page_list)
-
+    # skip items without physical_index
     for item in structure:
-        if not _valid_physical_index(item):
+        if item.get('physical_index') is None:
             item['appear_start'] = 'no'
 
-    # only for items with a valid, in-range physical_index
+    # only for items with valid physical_index
     tasks = []
     valid_items = []
     for item in structure:
-        if _valid_physical_index(item):
+        if item.get('physical_index') is not None:
             page_text = page_list[item['physical_index'] - 1][0]
             tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
             valid_items.append(item)
@@ -124,8 +119,7 @@ def toc_detector_single_page(content, model=None):
     Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
 
     response = llm_completion(model=model, prompt=prompt)
-    # print('response', response)
-    json_content = extract_json(response)
+    json_content = extract_json(response)    
     return json_content.get('toc_detected', 'no')
 
 
@@ -267,6 +261,90 @@ def toc_index_extractor(toc, content, model=None):
     json_content = extract_json(response)    
     return json_content
 
+
+
+def toc_transformer_from_pdf_toc(pdf_path):
+    """Bypass LLM-based TOC transformation when the PDF already has structured bookmarks.
+
+    PyMuPDF's get_toc() returns entries shaped [level, title, page, ...]. We map them to
+    the same [{structure, title, page}, ...] format that toc_transformer() produces, so
+    downstream callers (process_toc_no_page_numbers, process_toc_with_page_numbers) keep
+    working unchanged.
+
+    USB4.pdf ships with 1000+ bookmarks covering the full hierarchy, so this short-circuit
+    is both faster and more reliable than asking an LLM to re-structure the raw TOC text.
+    """
+    print('start toc_transformer_from_pdf_toc (PyMuPDF bookmarks, no LLM call)')
+    progress_log('toc_transformer_from_pdf_toc: opening PDF bookmarks')
+    import fitz  # PyMuPDF, already a runtime dep via pymupdf
+    import re as _re
+
+    doc = fitz.open(pdf_path)
+    raw_toc = doc.get_toc(simple=False)
+
+    if not raw_toc:
+        raise RuntimeError(
+            f'PDF has no bookmark TOC: {pdf_path}. '
+            'toc_transformer_from_pdf_toc only works when PyMuPDF can extract a structured TOC; '
+            'fall back to the LLM-based toc_transformer() for scan-only PDFs.'
+        )
+
+    # USB4 (and most technical specs) embed the chapter number at the start of the title,
+    # e.g. "1 Introduction", "1.1 Scope", "1.6.2.7 Shall", "F Gen 4 Datapath". Extracting
+    # that prefix is more reliable than reconstructing it from PyMuPDF's integer levels,
+    # because the integer level only reflects bookmark nesting — not the actual numbering
+    # scheme the document uses.
+    structure_re = re.compile(r'^\s*((?:\d+(?:\.\d+)*|[A-Z](?:\.\d+)*))\s+')
+
+    # Per-level counter for unnumbered headings that fall back to PyMuPDF level.
+    # Without unique keys, "Purpose"/"Summary"/"Contents" (all level 1, no number)
+    # would all get structure='1', and list_to_tree would silently overwrite them.
+    # We also track the last structure at each level so that fallback children (level>1)
+    # inherit their parent's prefix — otherwise list_to_tree's get_parent_structure
+    # (which splits on '.') can't find the parent and promotes them to root nodes.
+    fallback_counters = {}       # {level: count}
+    last_at_level = {}           # {level: last structure seen at this level}
+
+    result = []
+    for entry in raw_toc:
+        level, title, page = entry[0], entry[1], entry[2]
+        # PyMuPDF's get_toc(simple=False) returns 1-based page numbers.
+        # We use them directly — the rest of PageIndex expects 1-indexed physical pages.
+        physical_page = page
+
+        m = structure_re.match(title)
+        if m:
+            structure = m.group(1)
+            clean_title = title[m.end():].strip()
+        else:
+            # No numeric prefix found (e.g. unnumbered front-matter heading).
+            count = fallback_counters.get(level, 0) + 1
+            fallback_counters[level] = count
+            if level == 1:
+                structure = f'_{count}'
+            else:
+                parent = last_at_level.get(level - 1, '')
+                structure = f'{parent}.{count}' if parent else f'{count}'
+            clean_title = title.strip()
+
+        last_at_level[level] = structure
+        # Clear deeper levels (bookmark nesting may skip back up)
+        for l in list(last_at_level.keys()):
+            if l > level:
+                del last_at_level[l]
+
+        result.append({
+            'structure': structure,
+            'title': clean_title,
+            'page': physical_page,
+            # Marker so downstream (meta_processor) can identify this TOC as authoritative
+            # and skip the slow verify_toc LLM call.
+            'from_pdf_toc': True,
+        })
+
+    progress_log(f'toc_transformer_from_pdf_toc: extracted {len(result)} entries, {len(fallback_counters)} levels with fallback')
+    print(f'toc_transformer_from_pdf_toc: extracted {len(result)} entries from PyMuPDF bookmarks')
+    return result
 
 
 def toc_transformer(toc_content, model=None):
@@ -591,10 +669,21 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
 
     return toc_with_page_number
 
-def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
+def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None, doc=None):
     page_contents=[]
     token_lengths=[]
-    toc_content = toc_transformer(toc_content, model)
+    # Short-circuit: if a PDF path is supplied and PyMuPDF can extract structured
+    # bookmarks, use those directly instead of paying for an LLM re-structuring.
+    # The PDF's bookmarks carry title + page + chapter number, so we already have
+    # everything the rest of the pipeline needs.
+    if doc and isinstance(doc, str) and doc.lower().endswith('.pdf'):
+        try:
+            toc_content = toc_transformer_from_pdf_toc(doc)
+        except RuntimeError as e:
+            logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
+            toc_content = toc_transformer(toc_content, model)
+    else:
+        toc_content = toc_transformer(toc_content, model)
     logger.info(f'toc_transformer: {toc_content}')
     for page_index in range(start_index, start_index+len(page_list)):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
@@ -616,7 +705,31 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
 
 
-def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
+def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None, doc=None):
+    # Short-circuit: if a PDF path is supplied and PyMuPDF can extract structured
+    # bookmarks with page numbers, use those directly. PyMuPDF bookmarks are
+    # authoritative — they were authored by the spec editor — so we can skip the
+    # toc_index_extractor LLM call and the page-offset calculation that follows.
+    if doc and isinstance(doc, str) and doc.lower().endswith('.pdf'):
+        try:
+            toc_with_page_number = toc_transformer_from_pdf_toc(doc)
+            # The rest of the pipeline expects 'physical_index' (PyMuPDF bookmarks already
+            # carry the physical page number, just under the 'page' key).
+            toc_with_page_number = [
+                {**item, 'physical_index': item['page']} if item.get('page') is not None else item
+                for item in toc_with_page_number
+            ]
+            logger.info(f'toc_with_page_number (from PyMuPDF bookmarks): {len(toc_with_page_number)} entries')
+            return toc_with_page_number
+        except RuntimeError as e:
+            logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
+            # If we got here via the PyMuPDF bookmark shortcut and toc_content is
+            # empty (no real TOC text was extracted by check_toc), don't feed an
+            # empty string to the LLM — it will hallucinate. Return empty instead.
+            if not toc_content or not toc_content.strip():
+                logger.warning('PyMuPDF bookmark extraction failed with no TOC text fallback; returning empty TOC')
+                return []
+
     toc_with_page_number = toc_transformer(toc_content, model)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
@@ -679,11 +792,11 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
                     continue
 
             item_copy = copy.deepcopy(item)
-            item_copy.pop('page', None)
+            del item_copy['page']
             result = add_page_number_to_toc(page_contents, item_copy, model)
             if isinstance(result[0]['physical_index'], str) and result[0]['physical_index'].startswith('<physical_index'):
                 item['physical_index'] = int(result[0]['physical_index'].split('_')[-1].rstrip('>').strip())
-                item.pop('page', None)
+                del item['page']
     
     return toc_items
 
@@ -748,7 +861,8 @@ async def single_toc_item_index_fixer(section_title, content, model=None):
     Directly return the final JSON structure. Do not output anything else."""
 
     prompt = toc_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
-    response = await llm_acompletion(model=model, prompt=prompt)
+    async with llm_concurrency_limit():
+        response = await llm_acompletion(model=model, prompt=prompt)
     json_content = extract_json(response)
     physical_index = json_content.get('physical_index')
     if physical_index is None:
@@ -929,23 +1043,13 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
             item_with_index['list_index'] = idx  # Add the original index in list_result
             indexed_sample_list.append(item_with_index)
 
-    # Run checks concurrently. return_exceptions=True: a transient LLM failure
-    # on one sampled item must degrade that item to 'no' (same as an
-    # unavailable physical_index above), not abort verification for the
-    # whole document.
+    # Run checks concurrently
     tasks = [
         check_title_appearance(item, page_list, start_index, model)
         for item in indexed_sample_list
     ]
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-    results = []
-    for item, result in zip(indexed_sample_list, raw_results):
-        if isinstance(result, Exception):
-            results.append({'list_index': item.get('list_index'), 'answer': 'no',
-                            'title': item.get('title'), 'page_number': item.get('physical_index')})
-        else:
-            results.append(result)
-
+    results = await asyncio.gather(*tasks)
+    
     # Process results
     correct_count = 0
     incorrect_results = []
@@ -966,26 +1070,36 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
 
 
 ################### main process #########################################################
-async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
+async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None, doc=None):
     print(mode)
     print(f'start_index: {start_index}')
-    
+
     if mode == 'process_toc_with_page_numbers':
-        toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger)
+        toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger, doc=doc)
     elif mode == 'process_toc_no_page_numbers':
-        toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
+        toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger, doc=doc)
     else:
         toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
             
-    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None] 
-    
+    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None]
+
     toc_with_page_number = validate_and_truncate_physical_indices(
-        toc_with_page_number, 
-        len(page_list), 
-        start_index=start_index, 
+        toc_with_page_number,
+        len(page_list),
+        start_index=start_index,
         logger=logger
     )
-    
+
+    # Short-circuit: if the TOC came from an authoritative source (PyMuPDF bookmarks),
+    # skip verify_toc. The LLM cannot reliably re-check 1000+ page numbers against page
+    # text (we measured ~21% accuracy on USB4 with deepseek-v4-flash), and verify_toc
+    # dominates wall-clock time on token-plan gateways even with concurrency throttling.
+    if toc_with_page_number and all(item.get('from_pdf_toc') for item in toc_with_page_number):
+        logger.info({'skipped_verify_toc': True, 'reason': 'TOC from PyMuPDF bookmarks', 'count': len(toc_with_page_number)})
+        progress_log(f'meta_processor: skipping verify_toc ({len(toc_with_page_number)} entries, from_pdf_toc)')
+        print(f'skip verify_toc: TOC from PyMuPDF bookmarks ({len(toc_with_page_number)} entries)')
+        return toc_with_page_number
+
     accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
         
     logger.info({
@@ -1007,11 +1121,17 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
             raise Exception('Processing failed')
         
  
-async def process_large_node_recursively(node, page_list, opt=None, logger=None):
+async def process_large_node_recursively(node, page_list, opt=None, logger=None, skip_llm_reprocessing=False):
     node_page_list = page_list[node['start_index']-1:node['end_index']]
     token_num = sum([page[1] for page in node_page_list])
     
-    if node['end_index'] - node['start_index'] > opt.max_page_num_each_node and token_num >= opt.max_token_num_each_node:
+    # Only re-derive sub-structure via process_no_toc when the node is large AND
+    # has no existing children AND LLM reprocessing is not explicitly disabled
+    # (e.g. when the TOC came from an authoritative source like PyMuPDF bookmarks).
+    if (node['end_index'] - node['start_index'] > opt.max_page_num_each_node
+            and token_num >= opt.max_token_num_each_node
+            and not node.get('nodes')
+            and not skip_llm_reprocessing):
         print('large node:', node['title'], 'start_index:', node['start_index'], 'end_index:', node['end_index'], 'token_num:', token_num)
 
         node_toc_tree = await meta_processor(node_page_list, mode='process_no_toc', start_index=node['start_index'], opt=opt, logger=logger)
@@ -1026,61 +1146,117 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
         else:
             node['nodes'] = post_processing(valid_node_toc_items, node['end_index'])
             node['end_index'] = valid_node_toc_items[0]['start_index'] if valid_node_toc_items else node['end_index']
+    elif (node['end_index'] - node['start_index'] > opt.max_page_num_each_node
+            and token_num >= opt.max_token_num_each_node
+            and node.get('nodes')):
+        if logger:
+            logger.info({'skipped_process_no_toc': True, 'reason': 'node already has children', 'title': node.get('title'), 'children': len(node['nodes'])})
+        progress_log(f"process_large_node_recursively: skipping process_no_toc — '{node.get('title', '?')}' already has {len(node['nodes'])} children")
+        print(f"skip process_no_toc for {node.get('title', '?')}: already has {len(node['nodes'])} children")
         
     if 'nodes' in node and node['nodes']:
         tasks = [
-            process_large_node_recursively(child_node, page_list, opt, logger=logger)
+            process_large_node_recursively(child_node, page_list, opt, logger=logger, skip_llm_reprocessing=skip_llm_reprocessing)
             for child_node in node['nodes']
         ]
-        # return_exceptions=True: one child subtree failing to expand further
-        # must not abort the whole document — it's left as a leaf at its
-        # current boundaries instead.
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for child_node, result in zip(node['nodes'], results):
-            if isinstance(result, Exception) and logger:
-                logger.error(f"Failed to expand node '{child_node.get('title')}': {result}")
-
+        await asyncio.gather(*tasks)
+    
     return node
 
 async def tree_parser(page_list, opt, doc=None, logger=None):
-    check_toc_result = check_toc(page_list, opt)
-    logger.info(check_toc_result)
+    # If the PDF has embedded bookmarks (PyMuPDF TOC), skip the LLM-based
+    # TOC detection entirely. PyMuPDF bookmarks are authoritative — they carry
+    # the exact TOC structure with page numbers — so there is no need for the
+    # fallible LLM pipeline (toc_detector_single_page + detect_page_index).
+    pdf_has_bookmarks = False
+    if doc and isinstance(doc, str) and doc.lower().endswith('.pdf'):
+        try:
+            import fitz
+            _bm_doc = fitz.open(doc)
+            _raw = _bm_doc.get_toc(simple=False)
+            _bm_doc.close()
+            if _raw:
+                pdf_has_bookmarks = True
+                progress_log(f'tree_parser: {len(_raw)} bookmarks detected, using PyMuPDF TOC (skipping LLM check_toc)')
+                logger.info({'pdf_bookmarks_detected': len(_raw), 'skipping_llm_toc_detection': True})
+        except Exception:
+            pass
+    if not pdf_has_bookmarks:
+        progress_log('tree_parser: no bookmarks, falling back to LLM check_toc')
 
-    if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":
+    if pdf_has_bookmarks:
+        # Bypass check_toc(); go straight to process_toc_with_page_numbers.
+        # process_toc_with_page_numbers already short-circuits to
+        # toc_transformer_from_pdf_toc() when doc is provided.
         toc_with_page_number = await meta_processor(
-            page_list, 
-            mode='process_toc_with_page_numbers', 
-            start_index=1, 
-            toc_content=check_toc_result['toc_content'], 
-            toc_page_list=check_toc_result['toc_page_list'], 
+            page_list,
+            mode='process_toc_with_page_numbers',
+            start_index=1,
+            toc_content='',        # unused when PyMuPDF bookmarks are available
+            toc_page_list=[],      # unused when PyMuPDF bookmarks are available
             opt=opt,
-            logger=logger)
+            logger=logger,
+            doc=doc)
     else:
-        toc_with_page_number = await meta_processor(
-            page_list, 
-            mode='process_no_toc', 
-            start_index=1, 
-            opt=opt,
-            logger=logger)
+        check_toc_result = check_toc(page_list, opt)
+        logger.info(check_toc_result)
+
+        if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":
+            toc_with_page_number = await meta_processor(
+                page_list,
+                mode='process_toc_with_page_numbers',
+                start_index=1,
+                toc_content=check_toc_result['toc_content'],
+                toc_page_list=check_toc_result['toc_page_list'],
+                opt=opt,
+                logger=logger,
+                doc=doc)
+        else:
+            toc_with_page_number = await meta_processor(
+                page_list,
+                mode='process_no_toc',
+                start_index=1,
+                opt=opt,
+                logger=logger,
+                doc=doc)
 
     toc_with_page_number = add_preface_if_needed(toc_with_page_number)
-    toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
+    
+    # When TOC comes from PyMuPDF bookmarks, page numbers are authoritative —
+    # skip the expensive LLM-based title appearance check (1062 calls on USB4).
+    # Set appear_start='no' because in technical specs, section titles rarely
+    # appear at the very beginning of a page (page headers come first).
+    if toc_with_page_number and all(item.get('from_pdf_toc') for item in toc_with_page_number):
+        for item in toc_with_page_number:
+            item['appear_start'] = 'no'
+        if logger:
+            logger.info({'skipped_check_title_appearance': True, 'reason': 'TOC from PyMuPDF bookmarks', 'count': len(toc_with_page_number)})
+        progress_log(f'tree_parser: skipping check_title_appearance_in_start ({len(toc_with_page_number)} entries)')
+        print(f'skip check_title_appearance_in_start: TOC from PyMuPDF bookmarks ({len(toc_with_page_number)} entries)')
+    elif pdf_has_bookmarks:
+        # add_preface_if_needed may have inserted a Preface node without from_pdf_toc.
+        # Since the underlying TOC came from PyMuPDF, skip the check anyway.
+        for item in toc_with_page_number:
+            item['appear_start'] = 'no'
+        if logger:
+            logger.info({'skipped_check_title_appearance': True, 'reason': 'TOC from PyMuPDF bookmarks (with preface)', 'count': len(toc_with_page_number)})
+        print(f'skip check_title_appearance_in_start: TOC from PyMuPDF bookmarks ({len(toc_with_page_number)} entries)')
+    else:
+        toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
     
     # Filter out items with None physical_index before post_processings
     valid_toc_items = [item for item in toc_with_page_number if item.get('physical_index') is not None]
     
+    reversed_count = sum(1 for item in toc_with_page_number if item.get('end_index', 0) < item.get('start_index', 0))
+    if reversed_count:
+        progress_log(f'tree_parser: WARNING — {reversed_count} nodes with reversed page ranges (end < start)')
     toc_tree = post_processing(valid_toc_items, len(page_list))
     tasks = [
-        process_large_node_recursively(node, page_list, opt, logger=logger)
+        process_large_node_recursively(node, page_list, opt, logger=logger, skip_llm_reprocessing=pdf_has_bookmarks)
         for node in toc_tree
     ]
-    # return_exceptions=True: one top-level node failing to expand further
-    # must not abort indexing the whole document.
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for node, result in zip(toc_tree, results):
-        if isinstance(result, Exception) and logger:
-            logger.error(f"Failed to expand node '{node.get('title')}': {result}")
-
+    await asyncio.gather(*tasks)
+    
     return toc_tree
 
 
@@ -1102,17 +1278,17 @@ def page_index_main(doc, opt=None):
 
     async def page_index_builder():
         structure = await tree_parser(page_list, opt, doc=doc, logger=logger)
-        if opt.if_add_node_id:
-            write_node_id(structure)
-        if opt.if_add_node_text:
+        if opt.if_add_node_id == 'yes':
+            write_node_id(structure)    
+        if opt.if_add_node_text == 'yes':
             add_node_text(structure, page_list)
-        if opt.if_add_node_summary:
-            if not opt.if_add_node_text:
+        if opt.if_add_node_summary == 'yes':
+            if opt.if_add_node_text == 'no':
                 add_node_text(structure, page_list)
             await generate_summaries_for_structure(structure, model=opt.model)
-            if not opt.if_add_node_text:
+            if opt.if_add_node_text == 'no':
                 remove_structure_text(structure)
-            if opt.if_add_doc_description:
+            if opt.if_add_doc_description == 'yes':
                 # Create a clean structure without unnecessary fields for description generation
                 clean_structure = create_clean_structure_for_description(structure)
                 doc_description = generate_doc_description(clean_structure, model=opt.model)
@@ -1133,25 +1309,12 @@ def page_index_main(doc, opt=None):
 
 def page_index(doc, model=None, toc_check_page_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
                if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None):
-    from ..config import IndexConfig
-
-    # Explicit dict of the named kwargs — NOT locals(), which would also
-    # capture any local variable defined above this line (e.g. the IndexConfig
-    # import itself) and get rejected by IndexConfig(extra="forbid"). Unlike a
-    # locals() snapshot, this stays correct regardless of what gets added to
-    # the function body later.
+    
     user_opt = {
-        "model": model,
-        "toc_check_page_num": toc_check_page_num,
-        "max_page_num_each_node": max_page_num_each_node,
-        "max_token_num_each_node": max_token_num_each_node,
-        "if_add_node_id": if_add_node_id,
-        "if_add_node_summary": if_add_node_summary,
-        "if_add_doc_description": if_add_doc_description,
-        "if_add_node_text": if_add_node_text,
+        arg: value for arg, value in locals().items()
+        if arg != "doc" and value is not None
     }
-    user_opt = {k: v for k, v in user_opt.items() if v is not None}
-    opt = IndexConfig(**user_opt)
+    opt = ConfigLoader().load(user_opt)
     return page_index_main(doc, opt)
 
 

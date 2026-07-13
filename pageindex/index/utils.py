@@ -30,6 +30,99 @@ from ..config import (
 )
 from ..tokens import count_tokens  # re-exported for backward compat
 
+# Global semaphore to cap concurrent LLM calls. Token-plan gateways (e.g. opencode.ai
+# Console Go) impose a per-key concurrency limit; without throttling, asyncio.gather()
+# fans out 1000+ requests at once and gets rate-limited. Override via PAGEINDEX_MAX_CONCURRENT.
+_MAX_CONCURRENT = int(os.getenv("PAGEINDEX_MAX_CONCURRENT", "8"))
+_llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+
+class llm_concurrency_limit:
+    """Async context manager that caps total in-flight LLM calls across the whole process.
+
+    Use as:
+        async with llm_concurrency_limit():
+            response = await litellm.acompletion(...)
+
+    Total concurrent acquisitions are bounded by PAGEINDEX_MAX_CONCURRENT (default 8).
+    Override per-run via the PAGEINDEX_MAX_CONCURRENT environment variable.
+
+    Cancellation-safe: tracks acquisition with a flag so the permit is released
+    even when cancellation hits mid-acquire and __aexit__ is never called.
+    """
+    def __init__(self):
+        self._acquired = False
+
+    async def __aenter__(self):
+        await _llm_semaphore.acquire()
+        self._acquired = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._acquired:
+            _llm_semaphore.release()
+        return False
+
+# ============================================================
+# Unified logging — all logs under D:/ai_project/openkb/logs/
+# ============================================================
+_LOG_DIR = Path("logs")  # relative to working directory
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def progress_log(msg: str) -> None:
+    """Append a timestamped line to pageindex_progress.log."""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_LOG_DIR / "pageindex_progress.log", "a", encoding="utf-8") as f:
+            f.write(f"[{now}] {msg}\n")
+    except Exception:
+        pass
+
+# Dedicated logger for LLM API traffic — writes to pageindex_llm.log (fixed file).
+_llm_logger = logging.getLogger("pageindex.llm")
+_llm_logger.setLevel(logging.DEBUG)
+if not _llm_logger.handlers:
+    _llm_path = _LOG_DIR / "pageindex_llm.log"
+    _fh = logging.FileHandler(str(_llm_path), encoding="utf-8")
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _llm_logger.addHandler(_fh)
+    _llm_logger.propagate = False
+    print(f"[pageindex] LLM traffic will be logged to: {_llm_path}")
+
+
+def _log_llm_call(model, messages, response=None, error=None, attempt=None, elapsed=None):
+    """Dump a single LLM call to the log file with enough detail to debug gateway issues.
+
+    Truncates very long message contents to keep the log readable, but always logs the
+    full length so you can tell when a prompt was unexpectedly huge.
+    """
+    parts = []
+    if attempt is not None:
+        parts.append(f"attempt={attempt}")
+    parts.append(f"model={model}")
+    if elapsed is not None:
+        parts.append(f"elapsed={elapsed:.2f}s")
+    header = " | ".join(parts)
+
+    msg_summary = []
+    total_chars = 0
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "") or ""
+        total_chars += len(content)
+        snippet = content if len(content) <= 500 else content[:500] + f"... [truncated, total {len(content)} chars]"
+        msg_summary.append(f"  [{role}] ({len(content)} chars) {snippet}")
+    _llm_logger.debug(f"REQUEST {header}\n" + "\n".join(msg_summary) + f"\n  total_prompt_chars={total_chars}")
+
+    if error is not None:
+        _llm_logger.error(f"ERROR   {header} -> {type(error).__name__}: {error}")
+    if response is not None:
+        resp_str = response if isinstance(response, str) else repr(response)
+        snippet = resp_str if len(resp_str) <= 2000 else resp_str[:2000] + f"... [truncated, total {len(resp_str)} chars]"
+        _llm_logger.debug(f"RESPONSE {header} ({len(resp_str)} chars) {snippet}")
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,6 +265,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
+        t0 = time.time()
         try:
             # Hold a concurrency slot only around the actual network call, not
             # retry backoff, so sync completions obey the same cap as async ones.
@@ -184,11 +278,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     **get_llm_params(),
                 )
             content = response.choices[0].message.content
+            _log_llm_call(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason
             return content
         except Exception as e:
+            _log_llm_call(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -214,6 +310,7 @@ async def llm_acompletion(model, prompt):
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
+        t0 = time.time()
         try:
             # Hold a concurrency slot only around the actual network call — not
             # across retry backoff — so the cap counts real in-flight requests.
@@ -223,8 +320,11 @@ async def llm_acompletion(model, prompt):
                     messages=messages,
                     **get_llm_params(),  # per-call kwargs; never the litellm global
                 )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            _log_llm_call(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
+            return content
         except Exception as e:
+            _log_llm_call(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying async LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:

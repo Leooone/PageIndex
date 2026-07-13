@@ -69,7 +69,7 @@ def _run_async(coro):
         return pool.submit(ctx.run, asyncio.run, coro).result()
 
 
-def build_index(parsed: ParsedDocument, model: str = None, opt=None) -> dict:
+def build_index(parsed: ParsedDocument, model: str = None, opt=None, doc_path: str = None) -> dict:
     """Main entry point: ParsedDocument -> tree structure dict.
     Routes to the appropriate strategy and runs enhancement."""
     from .utils import (write_node_id, add_node_text, remove_structure_text,
@@ -94,7 +94,7 @@ def build_index(parsed: ParsedDocument, model: str = None, opt=None) -> dict:
         else:
             # Strategies 1-3: convert ContentNode list to page_list format for existing pipeline
             page_list = [(n.content, n.tokens) for n in nodes]
-            structure = _run_async(_content_based_pipeline(page_list, opt))
+            structure = _run_async(_content_based_pipeline(page_list, opt, doc_path))
 
         # Unified enhancement
         if opt.if_add_node_id:
@@ -141,7 +141,7 @@ class _NullLogger:
     def debug(self, message, **kwargs): pass
 
 
-async def _content_based_pipeline(page_list, opt):
+async def _content_based_pipeline(page_list, opt, doc_path=None):
     """Strategies 1-3: delegates to the existing PDF pipeline from pageindex/page_index.py.
 
     The page_list is already in the format expected by tree_parser:
@@ -150,5 +150,5 @@ async def _content_based_pipeline(page_list, opt):
     from .page_index import tree_parser
 
     logger = _NullLogger()
-    structure = await tree_parser(page_list, opt, doc=None, logger=logger)
+    structure = await tree_parser(page_list, opt, doc=doc_path, logger=logger)
     return structure

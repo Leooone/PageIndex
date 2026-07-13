@@ -116,7 +116,7 @@ class LocalBackend:
             # Store images alongside the document: files/{collection}/{doc_id}/images/
             images_dir = str(col_dir / doc_id / "images")
             parsed = parser.parse(file_path, model=self._model, images_dir=images_dir)
-            result = build_index(parsed, model=self._model, opt=self._index_config)
+            result = build_index(parsed, model=self._model, opt=self._index_config, doc_path=file_path)
 
             # Cache page text for fast retrieval (avoids re-reading files) and to
             # reconstruct node text on demand (get_document(include_text=True),
