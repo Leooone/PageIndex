@@ -213,7 +213,7 @@ def _sync_llm_semaphore():
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
     if model:
         model = model.removeprefix("litellm/")
-    max_retries = 10
+    max_retries = 50
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         t0 = time.time()
@@ -239,7 +239,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             logger.warning("Retrying LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
-                time.sleep(1)
+                time.sleep(30)
             else:
                 # Degrade gracefully instead of aborting the whole index: a single
                 # persistently-failing call returns an empty result so callers can
@@ -258,7 +258,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
-    max_retries = 10
+    max_retries = 50
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         t0 = time.time()
@@ -279,7 +279,7 @@ async def llm_acompletion(model, prompt):
             logger.warning("Retrying async LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(30)
             else:
                 # Degrade gracefully (see llm_completion): return an empty result
                 # so the caller skips this step and the rest of the document still
