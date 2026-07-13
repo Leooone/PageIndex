@@ -32,7 +32,7 @@ LLM 流程完全是冗余的。
 | PyMuPDF 页码 +1 偏移 | `get_toc()` 返回 1-based，原代码误当 0-based 多加了 1 |
 | 无编号标题 structure 重复 | fallback 加 `_{count}` 唯一键，防止 `list_to_tree` 覆盖 |
 | `appear_start='yes'` 导致页码逆序 | 改为 `'no'`，避免 `end_index = next_page - 1` |
-| 并发取消 permit 泄漏 | `llm_concurrency_limit` 改用 `_acquired` 标志位，去掉 `asyncio.shield` |
+| 并发取消 permit 泄漏 | `_llm_semaphore` / `_sync_llm_semaphore` 在 leaf 层限流，取消安全 |
 
 ### 可观测性
 

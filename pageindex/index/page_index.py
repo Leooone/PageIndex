@@ -36,8 +36,7 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
     }}
     Directly return the final JSON structure. Do not output anything else."""
 
-    async with llm_concurrency_limit():
-        response = await llm_acompletion(model=model, prompt=prompt)
+    response = await llm_acompletion(model=model, prompt=prompt)
     response = extract_json(response)
     if 'answer' in response:
         answer = response['answer']
@@ -65,8 +64,7 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     }}
     Directly return the final JSON structure. Do not output anything else."""
 
-    async with llm_concurrency_limit():
-        response = await llm_acompletion(model=model, prompt=prompt)
+    response = await llm_acompletion(model=model, prompt=prompt)
     response = extract_json(response)
     if logger:
         logger.info(f"Response: {response}")
@@ -77,16 +75,23 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     if logger:
         logger.info("Checking title appearance in start concurrently")
     
-    # skip items without physical_index
+    # Mark items we can't check as 'no' up front: missing physical_index, or one
+    # out of range for page_list. An out-of-range index (the LLM can emit one)
+    # would otherwise raise IndexError below — during task-list construction,
+    # outside the gather's return_exceptions protection — and abort the build.
+    def _valid_physical_index(item):
+        idx = item.get('physical_index')
+        return idx is not None and 1 <= idx <= len(page_list)
+
     for item in structure:
-        if item.get('physical_index') is None:
+        if not _valid_physical_index(item):
             item['appear_start'] = 'no'
 
-    # only for items with valid physical_index
+    # only for items with a valid, in-range physical_index
     tasks = []
     valid_items = []
     for item in structure:
-        if item.get('physical_index') is not None:
+        if _valid_physical_index(item):
             page_text = page_list[item['physical_index'] - 1][0]
             tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
             valid_items.append(item)
@@ -680,11 +685,13 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
         try:
             toc_content = toc_transformer_from_pdf_toc(doc)
         except RuntimeError as e:
-            logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
+            if logger:
+                logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
             toc_content = toc_transformer(toc_content, model)
     else:
         toc_content = toc_transformer(toc_content, model)
-    logger.info(f'toc_transformer: {toc_content}')
+    if logger:
+        logger.info(f'toc_transformer: {toc_content}')
     for page_index in range(start_index, start_index+len(page_list)):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
         page_contents.append(page_text)
@@ -719,15 +726,18 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
                 {**item, 'physical_index': item['page']} if item.get('page') is not None else item
                 for item in toc_with_page_number
             ]
-            logger.info(f'toc_with_page_number (from PyMuPDF bookmarks): {len(toc_with_page_number)} entries')
+            if logger:
+                logger.info(f'toc_with_page_number (from PyMuPDF bookmarks): {len(toc_with_page_number)} entries')
             return toc_with_page_number
         except RuntimeError as e:
-            logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
+            if logger:
+                logger.info(f'toc_transformer_from_pdf_toc unavailable, falling back to LLM: {e}')
             # If we got here via the PyMuPDF bookmark shortcut and toc_content is
             # empty (no real TOC text was extracted by check_toc), don't feed an
             # empty string to the LLM — it will hallucinate. Return empty instead.
             if not toc_content or not toc_content.strip():
-                logger.warning('PyMuPDF bookmark extraction failed with no TOC text fallback; returning empty TOC')
+                if logger:
+                    logger.warning('PyMuPDF bookmark extraction failed with no TOC text fallback; returning empty TOC')
                 return []
 
     toc_with_page_number = toc_transformer(toc_content, model)
@@ -792,11 +802,11 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
                     continue
 
             item_copy = copy.deepcopy(item)
-            del item_copy['page']
+            item_copy.pop('page', None)
             result = add_page_number_to_toc(page_contents, item_copy, model)
             if isinstance(result[0]['physical_index'], str) and result[0]['physical_index'].startswith('<physical_index'):
                 item['physical_index'] = int(result[0]['physical_index'].split('_')[-1].rstrip('>').strip())
-                del item['page']
+                item.pop('page', None)
     
     return toc_items
 
@@ -861,8 +871,7 @@ async def single_toc_item_index_fixer(section_title, content, model=None):
     Directly return the final JSON structure. Do not output anything else."""
 
     prompt = toc_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
-    async with llm_concurrency_limit():
-        response = await llm_acompletion(model=model, prompt=prompt)
+    response = await llm_acompletion(model=model, prompt=prompt)
     json_content = extract_json(response)
     physical_index = json_content.get('physical_index')
     if physical_index is None:
@@ -1043,12 +1052,22 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
             item_with_index['list_index'] = idx  # Add the original index in list_result
             indexed_sample_list.append(item_with_index)
 
-    # Run checks concurrently
+    # Run checks concurrently. return_exceptions=True: a transient LLM failure
+    # on one sampled item must degrade that item to 'no' (same as an
+    # unavailable physical_index above), not abort verification for the
+    # whole document.
     tasks = [
         check_title_appearance(item, page_list, start_index, model)
         for item in indexed_sample_list
     ]
-    results = await asyncio.gather(*tasks)
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = []
+    for item, result in zip(indexed_sample_list, raw_results):
+        if isinstance(result, Exception):
+            results.append({'list_index': item.get('list_index'), 'answer': 'no',
+                            'title': item.get('title'), 'page_number': item.get('physical_index')})
+        else:
+            results.append(result)
     
     # Process results
     correct_count = 0
@@ -1159,7 +1178,13 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None,
             process_large_node_recursively(child_node, page_list, opt, logger=logger, skip_llm_reprocessing=skip_llm_reprocessing)
             for child_node in node['nodes']
         ]
-        await asyncio.gather(*tasks)
+        # return_exceptions=True: one child subtree failing to expand further
+        # must not abort the whole document — it's left as a leaf at its
+        # current boundaries instead.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for child_node, result in zip(node['nodes'], results):
+            if isinstance(result, Exception) and logger:
+                logger.error(f"Failed to expand node '{child_node.get('title')}': {result}")
     
     return node
 
@@ -1256,7 +1281,12 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
         process_large_node_recursively(node, page_list, opt, logger=logger, skip_llm_reprocessing=pdf_has_bookmarks)
         for node in toc_tree
     ]
-    await asyncio.gather(*tasks)
+    # return_exceptions=True: one top-level node failing to expand further
+    # must not abort indexing the whole document.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for node, result in zip(toc_tree, results):
+        if isinstance(result, Exception) and logger:
+            logger.error(f"Failed to expand node '{node.get('title')}': {result}")
     
     return toc_tree
 
@@ -1279,17 +1309,17 @@ def page_index_main(doc, opt=None):
 
     async def page_index_builder():
         structure = await tree_parser(page_list, opt, doc=doc, logger=logger)
-        if opt.if_add_node_id == 'yes':
-            write_node_id(structure)    
-        if opt.if_add_node_text == 'yes':
+        if opt.if_add_node_id:
+            write_node_id(structure)
+        if opt.if_add_node_text:
             add_node_text(structure, page_list)
-        if opt.if_add_node_summary == 'yes':
-            if opt.if_add_node_text == 'no':
+        if opt.if_add_node_summary:
+            if not opt.if_add_node_text:
                 add_node_text(structure, page_list)
             await generate_summaries_for_structure(structure, model=opt.model)
-            if opt.if_add_node_text == 'no':
+            if not opt.if_add_node_text:
                 remove_structure_text(structure)
-            if opt.if_add_doc_description == 'yes':
+            if opt.if_add_doc_description:
                 # Create a clean structure without unnecessary fields for description generation
                 clean_structure = create_clean_structure_for_description(structure)
                 doc_description = generate_doc_description(clean_structure, model=opt.model)
@@ -1310,12 +1340,23 @@ def page_index_main(doc, opt=None):
 
 def page_index(doc, model=None, toc_check_page_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
                if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None):
-    
+    from ..config import IndexConfig
+
+    # Explicit dict of the named kwargs — NOT locals(), which would also
+    # capture any local variable defined above this line (e.g. the IndexConfig
+    # import itself) and get rejected by IndexConfig(extra="forbid").
     user_opt = {
-        arg: value for arg, value in locals().items()
-        if arg != "doc" and value is not None
+        "model": model,
+        "toc_check_page_num": toc_check_page_num,
+        "max_page_num_each_node": max_page_num_each_node,
+        "max_token_num_each_node": max_token_num_each_node,
+        "if_add_node_id": if_add_node_id,
+        "if_add_node_summary": if_add_node_summary,
+        "if_add_doc_description": if_add_doc_description,
+        "if_add_node_text": if_add_node_text,
     }
-    opt = ConfigLoader().load(user_opt)
+    user_opt = {k: v for k, v in user_opt.items() if v is not None}
+    opt = IndexConfig(**user_opt)
     return page_index_main(doc, opt)
 
 

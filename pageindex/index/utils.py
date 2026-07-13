@@ -31,8 +31,8 @@ def _log_suffix() -> str:
 def progress_log(msg: str) -> None:
     """Append a timestamped line to pageindex_progress[_doc].log."""
     try:
-        now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_dir = __import__("pathlib").Path("logs")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_dir = Path("logs")
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(log_dir / f"pageindex_progress{_log_suffix()}.log", "a", encoding="utf-8") as f:
             f.write(f"[{now}] {msg}\n")
@@ -43,8 +43,8 @@ def llm_log(model: str, messages: list, response: str = "",
             error: str = "", attempt: int = 0, elapsed: float = 0) -> None:
     """Write a single LLM call record to pageindex_llm[_doc].log."""
     try:
-        now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_dir = __import__("pathlib").Path("logs")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_dir = Path("logs")
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(log_dir / f"pageindex_llm{_log_suffix()}.log", "a", encoding="utf-8") as f:
             if error:
@@ -229,7 +229,6 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     **get_llm_params(),
                 )
             content = response.choices[0].message.content
-            t0_val = time.time() - t0 if 't0' in dir() else 0
             llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
