@@ -91,20 +91,25 @@ def progress_log(msg: str) -> None:
     except Exception:
         pass
 
-# Dedicated logger for LLM API traffic — writes to pageindex_llm[_doc].log.
-_llm_logger = logging.getLogger("pageindex.llm")
-_llm_logger.setLevel(logging.DEBUG)
-if not _llm_logger.handlers:
-    _llm_path = _LOG_DIR / f"pageindex_llm{_log_suffix()}.log"
-    _fh = logging.FileHandler(str(_llm_path), encoding="utf-8")
-    _fh.setLevel(logging.DEBUG)
-    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    _llm_logger.addHandler(_fh)
-    _llm_logger.propagate = False
-    print(f"[pageindex] LLM traffic will be logged to: {_llm_path}")
+def llm_log(model: str, messages: list, response: str = "",
+            error: str = "", attempt: int = 0, elapsed: float = 0) -> None:
+    """Write a single LLM call record to pageindex_llm[_doc].log."""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_LOG_DIR / f"pageindex_llm{_log_suffix()}.log", "a", encoding="utf-8") as f:
+            if error:
+                f.write(f"{now} [ERROR] attempt={attempt} | model={error} | elapsed={elapsed:.2f}s\n")
+            else:
+                msg_str = json.dumps(messages[-1].get("content","")[:200]) if messages else ""
+                f.write(f"{now} [DEBUG] REQUEST attempt={attempt} | elapsed={elapsed:.2f}s\n")
+                f.write(f"  prompt_preview={msg_str}\n")
+                f.write(f"{now} [DEBUG] RESPONSE attempt={attempt} | elapsed={elapsed:.2f}s ({len(response)} chars)\n")
+                f.write(f"  {response[:200]}\n")
+    except Exception:
+        pass
 
 
-def _log_llm_call(model, messages, response=None, error=None, attempt=None, elapsed=None):
+def llm_log(model, messages, response=None, error=None, attempt=None, elapsed=None):
     """Dump a single LLM call to the log file with enough detail to debug gateway issues.
 
     Truncates very long message contents to keep the log readable, but always logs the
@@ -291,13 +296,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     **get_llm_params(),
                 )
             content = response.choices[0].message.content
-            _log_llm_call(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason
             return content
         except Exception as e:
-            _log_llm_call(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -334,10 +339,10 @@ async def llm_acompletion(model, prompt):
                     **get_llm_params(),  # per-call kwargs; never the litellm global
                 )
             content = response.choices[0].message.content
-            _log_llm_call(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             return content
         except Exception as e:
-            _log_llm_call(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying async LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
