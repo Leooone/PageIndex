@@ -418,12 +418,12 @@ def get_leaf_nodes(structure):
 
 
 async def generate_node_summary(node, model=None):
-    prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
+    prompt = f"""You are given a part of a document, your task is to generate a single-paragraph summary of the partial document about what are main points covered in the partial document. State only WHAT topics are covered — do not explain them.
 
-    Partial Document Text: {node['text']}
+Partial Document Text: {node['text']}
 
-    Directly return the description, do not include any other text.
-    """
+Directly return the summary, do not include any other text.
+"""
     response = await llm_acompletion(model, prompt)
     return response
 
