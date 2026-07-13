@@ -109,53 +109,6 @@ def llm_log(model: str, messages: list, response: str = "",
         pass
 
 
-def llm_log(model, messages, response=None, error=None, attempt=None, elapsed=None):
-    """Dump a single LLM call to the log file with enough detail to debug gateway issues.
-
-    Truncates very long message contents to keep the log readable, but always logs the
-    full length so you can tell when a prompt was unexpectedly huge.
-    """
-    parts = []
-    if attempt is not None:
-        parts.append(f"attempt={attempt}")
-    parts.append(f"model={model}")
-    if elapsed is not None:
-        parts.append(f"elapsed={elapsed:.2f}s")
-    header = " | ".join(parts)
-
-    msg_summary = []
-    total_chars = 0
-    for m in messages:
-        role = m.get("role", "?")
-        content = m.get("content", "") or ""
-        total_chars += len(content)
-        snippet = content if len(content) <= 500 else content[:500] + f"... [truncated, total {len(content)} chars]"
-        msg_summary.append(f"  [{role}] ({len(content)} chars) {snippet}")
-    _llm_logger.debug(f"REQUEST {header}\n" + "\n".join(msg_summary) + f"\n  total_prompt_chars={total_chars}")
-
-    if error is not None:
-        _llm_logger.error(f"ERROR   {header} -> {type(error).__name__}: {error}")
-    if response is not None:
-        resp_str = response if isinstance(response, str) else repr(response)
-        snippet = resp_str if len(resp_str) <= 2000 else resp_str[:2000] + f"... [truncated, total {len(resp_str)} chars]"
-        _llm_logger.debug(f"RESPONSE {header} ({len(resp_str)} chars) {snippet}")
-
-
-logger = logging.getLogger(__name__)
-
-
-# TRUE process-wide ceiling on concurrent in-flight LLM calls, shared across
-# EVERY thread and event loop (a plain threading.Semaphore, not an
-# asyncio.Semaphore — those are bound to the loop that created them, so one per
-# loop would let N concurrently-indexing threads each get their own full-size
-# cap and multiply the effective bound by N). Resized lazily when the
-# process-wide default changes; resizing isn't perfectly atomic against
-# in-flight acquires, which is fine since it only happens on an explicit
-# set_max_concurrency() config change, not on the hot path.
-_PROCESS_LLM_SEMAPHORE: threading.Semaphore | None = None
-_PROCESS_LLM_SEMAPHORE_SIZE: int | None = None
-_PROCESS_LLM_SEMAPHORE_LOCK = threading.Lock()
-
 
 def _process_ceiling_semaphore() -> threading.Semaphore:
     global _PROCESS_LLM_SEMAPHORE, _PROCESS_LLM_SEMAPHORE_SIZE
