@@ -15,49 +15,6 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from pprint import pprint
-
-# ============================================================
-# Logging helpers — all logs under logs/ (relative to cwd)
-# ============================================================
-_current_doc_name: str = ""
-
-def set_doc_name(name: str) -> None:
-    global _current_doc_name
-    _current_doc_name = name
-
-def _log_suffix() -> str:
-    return f"_{_current_doc_name}" if _current_doc_name else ""
-
-def progress_log(msg: str) -> None:
-    """Append a timestamped line to pageindex_progress[_doc].log."""
-    try:
-        now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_dir = __import__("pathlib").Path("logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"pageindex_progress{_log_suffix()}.log", "a", encoding="utf-8") as f:
-            f.write(f"[{now}] {msg}\n")
-    except Exception:
-        pass
-
-def llm_log(model: str, messages: list, response: str = "",
-            error: str = "", attempt: int = 0, elapsed: float = 0) -> None:
-    """Write a single LLM call record to pageindex_llm[_doc].log."""
-    try:
-        now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_dir = __import__("pathlib").Path("logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"pageindex_llm{_log_suffix()}.log", "a", encoding="utf-8") as f:
-            if error:
-                f.write(f"[{now}] ERROR attempt={attempt} elapsed={elapsed:.1f}s {error}\n")
-            else:
-                preview = str(messages[-1].get("content",""))[:150].replace("\n"," ") if messages else ""
-                f.write(f"[{now}] REQUEST attempt={attempt} model=... elapsed={elapsed:.1f}s\n")
-                f.write(f"         {preview}\n")
-                f.write(f"[{now}] RESPONSE attempt={attempt} elapsed={elapsed:.1f}s ({len(response)} chars)\n")
-                f.write(f"         {response[:200].replace(chr(10),' ')}\n")
-    except Exception:
-        pass
-
 # Aliased with a leading underscore so `from .utils import *` (used by the
 # page_index modules) doesn't export a name `config` that would shadow the real
 # `pageindex.config` submodule for those modules.
@@ -73,20 +30,84 @@ from ..config import (
 )
 from ..tokens import count_tokens  # re-exported for backward compat
 
-logger = logging.getLogger(__name__)
+# Global semaphore to cap concurrent LLM calls. Token-plan gateways (e.g. opencode.ai
+# Console Go) impose a per-key concurrency limit; without throttling, asyncio.gather()
+# fans out 1000+ requests at once and gets rate-limited. Override via PAGEINDEX_MAX_CONCURRENT.
+_MAX_CONCURRENT = int(os.getenv("PAGEINDEX_MAX_CONCURRENT", "8"))
+_llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 
 
-# TRUE process-wide ceiling on concurrent in-flight LLM calls, shared across
-# EVERY thread and event loop (a plain threading.Semaphore, not an
-# asyncio.Semaphore — those are bound to the loop that created them, so one per
-# loop would let N concurrently-indexing threads each get their own full-size
-# cap and multiply the effective bound by N). Resized lazily when the
-# process-wide default changes; resizing isn't perfectly atomic against
-# in-flight acquires, which is fine since it only happens on an explicit
-# set_max_concurrency() config change, not on the hot path.
-_PROCESS_LLM_SEMAPHORE: threading.Semaphore | None = None
-_PROCESS_LLM_SEMAPHORE_SIZE: int | None = None
-_PROCESS_LLM_SEMAPHORE_LOCK = threading.Lock()
+class llm_concurrency_limit:
+    """Async context manager that caps total in-flight LLM calls across the whole process.
+
+    Use as:
+        async with llm_concurrency_limit():
+            response = await litellm.acompletion(...)
+
+    Total concurrent acquisitions are bounded by PAGEINDEX_MAX_CONCURRENT (default 8).
+    Override per-run via the PAGEINDEX_MAX_CONCURRENT environment variable.
+
+    Cancellation-safe: tracks acquisition with a flag so the permit is released
+    even when cancellation hits mid-acquire and __aexit__ is never called.
+    """
+    def __init__(self):
+        self._acquired = False
+
+    async def __aenter__(self):
+        await _llm_semaphore.acquire()
+        self._acquired = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._acquired:
+            _llm_semaphore.release()
+        return False
+
+# ============================================================
+# Unified logging — all logs under D:/ai_project/openkb/logs/
+# ============================================================
+_LOG_DIR = Path("logs")  # relative to working directory
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Per-document log prefix, set by tree_parser when processing starts.
+# Avoids log file conflicts when multiple documents are processed concurrently.
+_current_doc_name: str = ""
+
+def set_doc_name(name: str) -> None:
+    """Set the current document name for log file naming."""
+    global _current_doc_name
+    _current_doc_name = name
+
+def _log_suffix() -> str:
+    """Return log filename suffix with doc name if set."""
+    return f"_{_current_doc_name}" if _current_doc_name else ""
+
+def progress_log(msg: str) -> None:
+    """Append a timestamped line to pageindex_progress[_doc].log."""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_LOG_DIR / f"pageindex_progress{_log_suffix()}.log", "a", encoding="utf-8") as f:
+            f.write(f"[{now}] {msg}\n")
+    except Exception:
+        pass
+
+def llm_log(model: str, messages: list, response: str = "",
+            error: str = "", attempt: int = 0, elapsed: float = 0) -> None:
+    """Write a single LLM call record to pageindex_llm[_doc].log."""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_LOG_DIR / f"pageindex_llm{_log_suffix()}.log", "a", encoding="utf-8") as f:
+            if error:
+                f.write(f"{now} [ERROR] attempt={attempt} | model={error} | elapsed={elapsed:.2f}s\n")
+            else:
+                msg_str = json.dumps(messages[-1].get("content","")[:200]) if messages else ""
+                f.write(f"{now} [DEBUG] REQUEST attempt={attempt} | elapsed={elapsed:.2f}s\n")
+                f.write(f"  prompt_preview={msg_str}\n")
+                f.write(f"{now} [DEBUG] RESPONSE attempt={attempt} | elapsed={elapsed:.2f}s ({len(response)} chars)\n")
+                f.write(f"  {response[:200]}\n")
+    except Exception:
+        pass
+
 
 
 def _process_ceiling_semaphore() -> threading.Semaphore:
@@ -228,14 +249,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     **get_llm_params(),
                 )
             content = response.choices[0].message.content
-            t0_val = time.time() - t0 if 't0' in dir() else 0
             llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason
             return content
         except Exception as e:
-            llm_log(model, messages, error=str(e), attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -275,7 +295,7 @@ async def llm_acompletion(model, prompt):
             llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             return content
         except Exception as e:
-            llm_log(model, messages, error=str(e), attempt=i + 1, elapsed=time.time() - t0)
+            llm_log(model, messages, error=e, attempt=i + 1, elapsed=time.time() - t0)
             logger.warning("Retrying async LLM completion (%d/%d)", i + 1, max_retries)
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -431,7 +451,7 @@ async def generate_node_summary(node, model=None):
 async def generate_summaries_for_structure(structure, model=None):
     nodes = structure_to_list(structure)
     total = len(nodes)
-    progress_log(f"generate_summaries: starting {total} node summaries")
+    progress_log(f"generate_summaries_for_structure: starting {total} node summaries")
     print(f"  Generating summaries for {total} nodes...")
     tasks = [generate_node_summary(node, model=model) for node in nodes]
     # return_exceptions=True: one node's summary failing (e.g. a transient LLM
@@ -440,7 +460,7 @@ async def generate_summaries_for_structure(structure, model=None):
     raw_summaries = await asyncio.gather(*tasks, return_exceptions=True)
     succeeded = sum(1 for s in raw_summaries if not isinstance(s, Exception))
     failed = total - succeeded
-    progress_log(f"generate_summaries: done — {succeeded}/{total} ok, {failed} failed")
+    progress_log(f"generate_summaries_for_structure: done — {succeeded}/{total} ok, {failed} failed")
     print(f"  Summaries: {succeeded}/{total} ok" + (f", {failed} failed" if failed else ""))
     summaries = [
         node.get('text', '') if isinstance(s, Exception) else s
