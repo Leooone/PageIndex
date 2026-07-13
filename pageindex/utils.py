@@ -69,20 +69,33 @@ class llm_concurrency_limit:
 _LOG_DIR = Path("logs")  # relative to working directory
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# Per-document log prefix, set by tree_parser when processing starts.
+# Avoids log file conflicts when multiple documents are processed concurrently.
+_current_doc_name: str = ""
+
+def set_doc_name(name: str) -> None:
+    """Set the current document name for log file naming."""
+    global _current_doc_name
+    _current_doc_name = name
+
+def _log_suffix() -> str:
+    """Return log filename suffix with doc name if set."""
+    return f"_{_current_doc_name}" if _current_doc_name else ""
+
 def progress_log(msg: str) -> None:
-    """Append a timestamped line to pageindex_progress.log."""
+    """Append a timestamped line to pageindex_progress[_doc].log."""
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(_LOG_DIR / "pageindex_progress.log", "a", encoding="utf-8") as f:
+        with open(_LOG_DIR / f"pageindex_progress{_log_suffix()}.log", "a", encoding="utf-8") as f:
             f.write(f"[{now}] {msg}\n")
     except Exception:
         pass
 
-# Dedicated logger for LLM API traffic — writes to pageindex_llm.log (fixed file).
+# Dedicated logger for LLM API traffic — writes to pageindex_llm[_doc].log.
 _llm_logger = logging.getLogger("pageindex.llm")
 _llm_logger.setLevel(logging.DEBUG)
 if not _llm_logger.handlers:
-    _llm_path = _LOG_DIR / "pageindex_llm.log"
+    _llm_path = _LOG_DIR / f"pageindex_llm{_log_suffix()}.log"
     _fh = logging.FileHandler(str(_llm_path), encoding="utf-8")
     _fh.setLevel(logging.DEBUG)
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))

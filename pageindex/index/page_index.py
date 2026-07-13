@@ -1170,6 +1170,7 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     # fallible LLM pipeline (toc_detector_single_page + detect_page_index).
     pdf_has_bookmarks = False
     if doc and isinstance(doc, str) and doc.lower().endswith('.pdf'):
+        set_doc_name(os.path.splitext(os.path.basename(doc))[0])
         try:
             import fitz
             _bm_doc = fitz.open(doc)
