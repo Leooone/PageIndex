@@ -64,3 +64,40 @@ OpenKB 侧的日志：
 |---|---|
 | `openkb_progress.log` | compiler 每步进度 |
 | `openkb_llm.log` | compiler LLM 请求/响应（含内容预览） |
+
+## 限速配置
+
+继承自 [PageIndex PR #343](https://github.com/VectifyAI/PageIndex/pull/343)，解决 MiniMax Token Plan 等 API 的速率限制问题。
+
+### 环境变量
+
+```bash
+# .env
+PAGEINDEX_MAX_CONCURRENCY=1   # 并发上限（默认 5）
+PAGEINDEX_RPM_LIMIT=20        # 每分钟请求上限（默认 0=不限）
+```
+
+| 参数 | 作用 | 建议值 |
+|---|---|---|
+| `PAGEINDEX_MAX_CONCURRENCY` | 同时飞行中的 LLM 调用数 | 1–5 |
+| `PAGEINDEX_RPM_LIMIT` | 滑动窗口限速（60s 窗口） | 20（MiniMax Token Plan） |
+
+### 新增组件
+
+- **`SlidingWindowRateLimiter`**（`index/utils.py`）— 60 秒滑动窗口，强制最小请求间隔（60/RPM 秒）
+- **`_extract_retry_delay()`**（`index/utils.py`）— 429 时解析 Retry-After 响应头，无头时指数退避+抖动
+- **`_is_rate_limit_error()`**（`index/utils.py`）— 自动检测 HTTP 429 错误
+- **`rpm_limit_scope()`**（`config.py`）— 与 `max_concurrency_scope()` 同机制的作用域管理
+
+### 工作原理
+
+```
+RPM=20, 并发=5:
+
+请求1: limiter.wait() → 立即放行 → 抢槽位 → API调用
+请求2: limiter.wait() → 等3s → 放行 → 抢槽位 → API调用
+请求3: limiter.wait() → 等6s → 放行 → ...
+...
+limiter 在信号量之前拦截，保证发射频率 ≤ RPM
+即使并发设很高，实际飞行中的请求 ≈ RPM × (API耗时/60)
+```

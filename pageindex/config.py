@@ -35,6 +35,10 @@ class IndexConfig(BaseModel):
     # (get_llm_params(), overridable via set_llm_params()). Scoped via
     # llm_params_scope so it doesn't leak into other concurrent indexing calls.
     llm_params: dict | None = None
+    # Requests-per-minute cap for LLM calls during indexing. 0 = disabled (no
+    # rate limiting). Configured via PAGEINDEX_RPM_LIMIT env var or explicitly
+    # per-index via IndexConfig(rpm_limit=…).
+    rpm_limit: int = 0
 
     @field_validator("max_concurrency", mode="before")
     @classmethod
@@ -214,6 +218,53 @@ def max_concurrency_scope(value: int | None):
     finally:
         _MAX_CONCURRENCY_SCOPE_SEMAPHORE.reset(sem_token)
         _MAX_CONCURRENCY_OVERRIDE.reset(token)
+
+
+# ============================================================
+# RPM limit — sliding-window rate limiter, akin to max_concurrency
+# but controlling request *frequency* rather than in-flight count.
+# ============================================================
+
+def _env_rpm_limit_default() -> int:
+    """Default RPM cap from PAGEINDEX_RPM_LIMIT; 0 = disabled."""
+    raw = os.getenv("PAGEINDEX_RPM_LIMIT", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value >= 0 else 0
+
+
+_RPM_LIMIT: int = _env_rpm_limit_default()
+_RPM_LIMIT_OVERRIDE: ContextVar[int | None] = ContextVar(
+    "pageindex_rpm_limit_override", default=None
+)
+
+
+def get_rpm_limit() -> int:
+    """Return the effective RPM cap (0 = disabled)."""
+    override = _RPM_LIMIT_OVERRIDE.get()
+    return override if override is not None else _RPM_LIMIT
+
+
+@contextmanager
+def rpm_limit_scope(value: int | None):
+    """Scope a per-index RPM limit override to the current context.
+
+    ``value=None`` or ``0`` means \"no override\" (fall back to the process
+    default, which itself may be 0 = disabled). Also activates/deactivates
+    the sliding-window rate limiter in utils.py. Reset on exit.
+    """
+    effective = value if value is not None and value > 0 else 0
+    token = _RPM_LIMIT_OVERRIDE.set(effective or None)
+    # Lazy import to avoid circular dependency (utils imports config)
+    from pageindex.index.utils import set_rpm_limit as _set_rpm
+    try:
+        _set_rpm(effective if effective > 0 else None)
+        yield
+    finally:
+        _set_rpm(None)
+        _RPM_LIMIT_OVERRIDE.reset(token)
 
 
 def get_llm_params() -> dict:

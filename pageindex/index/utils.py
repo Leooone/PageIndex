@@ -6,6 +6,7 @@ import time
 import json
 import copy
 import re
+import random
 import asyncio
 import threading
 import PyPDF2
@@ -210,14 +211,174 @@ def _sync_llm_semaphore():
             ceiling_sem.release()
 
 
+# ============================================================
+# Sliding-window rate limiter — prevents API burst overload
+# with configurable RPM and minimum spacing between calls.
+# Configure via PAGEINDEX_RPM_LIMIT env var or set_rpm_limit().
+# ============================================================
+
+class SlidingWindowRateLimiter:
+    """Sliding-window log rate limiter.
+
+    Tracks request timestamps across a 60-second window and enforces
+    a minimum spacing between consecutive requests to prevent bursts.
+    """
+
+    def __init__(self, requests_per_minute: int):
+        self.requests_per_minute = requests_per_minute
+        self.request_times: list[float] = []
+        self.lock = threading.Lock()
+
+    def _wait_time(self) -> float:
+        with self.lock:
+            now = time.time()
+            # Prune expired entries (older than 60s)
+            self.request_times = [t for t in self.request_times if now - t < 60.0]
+            min_spacing = 60.0 / self.requests_per_minute if self.requests_per_minute > 0 else 0
+
+            if self.request_times:
+                last_scheduled = self.request_times[-1]
+                earliest_start = last_scheduled + min_spacing
+            else:
+                earliest_start = now
+
+            if len(self.request_times) < self.requests_per_minute:
+                scheduled_time = max(now, earliest_start)
+                self.request_times.append(scheduled_time)
+                return max(0.0, scheduled_time - now)
+
+            # Window full — wait for oldest entry to expire
+            oldest = self.request_times[0]
+            window_wait = 60.0 - (now - oldest)
+            scheduled_time = max(now + window_wait, earliest_start)
+            self.request_times.append(scheduled_time)
+            return max(0.0, scheduled_time - now)
+
+    def wait_sync(self) -> None:
+        if self.requests_per_minute <= 0:
+            return
+        wait_t = self._wait_time()
+        if wait_t > 0:
+            time.sleep(wait_t)
+
+    async def wait_async(self) -> None:
+        if self.requests_per_minute <= 0:
+            return
+        wait_t = self._wait_time()
+        if wait_t > 0:
+            await asyncio.sleep(wait_t)
+
+
+# Global rate limiter instance; configured via set_rpm_limit().
+_rate_limiter: SlidingWindowRateLimiter | None = None
+
+
+def set_rpm_limit(limit: int | None) -> None:
+    global _rate_limiter
+    if limit is not None and limit > 0:
+        _rate_limiter = SlidingWindowRateLimiter(limit)
+    else:
+        _rate_limiter = None
+
+
+def get_rate_limiter() -> SlidingWindowRateLimiter | None:
+    return _rate_limiter
+
+
+# ============================================================
+# 429-aware retry helpers — parse provider rate-limit headers
+# and compute intelligent backoff delays.
+# ============================================================
+
+def _is_rate_limit_error(exception: Exception) -> bool:
+    """Check if an exception is caused by a rate limit (HTTP 429)."""
+    error_str = str(exception).lower()
+    if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+        return True
+    if hasattr(litellm, "RateLimitError") and isinstance(exception, litellm.RateLimitError):
+        return True
+    return False
+
+
+def _extract_retry_headers(exception: Exception) -> tuple[str | None, str | None]:
+    """Extract Retry-After and rate-limit reset headers from the exception."""
+    retry_after = None
+    reset_requests = None
+
+    for attr in ("_response_headers", "response_headers"):
+        headers = getattr(exception, attr, None)
+        if headers and isinstance(headers, dict):
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            reset_requests = headers.get("x-ratelimit-reset-requests")
+            break
+
+    if not retry_after:
+        match = re.search(r"Retry-After:\s*(\d+)", str(exception))
+        if match:
+            retry_after = match.group(1)
+
+    return retry_after, reset_requests
+
+
+def _extract_retry_delay(exception: Exception, attempt: int) -> float:
+    """Determine how long to wait before retrying.
+
+    Priority:
+    1. Retry-After header from the provider (seconds or HTTP-date)
+    2. x-ratelimit-reset-requests header (estimated reset time)
+    3. Exponential backoff with jitter (fallback)
+    """
+    if not _is_rate_limit_error(exception):
+        # Non-rate-limit errors: standard exponential backoff with jitter
+        delay = min(10.0, 1.0 * (1.5 ** attempt))
+        return delay + random.uniform(0.0, 0.5)
+
+    # Rate-limit errors: try to respect provider headers
+    retry_after, reset_requests = _extract_retry_headers(exception)
+
+    # 1. Retry-After header (seconds or HTTP-date)
+    if retry_after:
+        try:
+            seconds = int(retry_after)
+            capped = min(seconds, 120)
+            return capped + random.uniform(0.0, 1.0)
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                retry_time = parsedate_to_datetime(retry_after)
+                from datetime import timezone as _timezone
+                wait = (retry_time - datetime.now(_timezone.utc)).total_seconds()
+                if 0 < wait <= 120:
+                    return wait + random.uniform(0.0, 1.0)
+            except Exception:
+                pass
+
+    # 2. x-ratelimit-reset-requests header
+    if reset_requests:
+        try:
+            seconds = float(reset_requests)
+            if 0 < seconds <= 120:
+                return seconds + random.uniform(0.0, 1.0)
+        except ValueError:
+            pass
+
+    # 3. Fallback: exponential backoff with jitter for rate limits
+    delay = min(30.0, 5.0 * (1.5 ** attempt))
+    return delay + random.uniform(0.0, 2.0)
+
+
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
     if model:
         model = model.removeprefix("litellm/")
-    max_retries = 50
+    max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
+    limiter = get_rate_limiter()
     for i in range(max_retries):
         t0 = time.time()
         try:
+            # Optional RPM rate limiter (before acquiring concurrency slot)
+            if limiter:
+                limiter.wait_sync()
             # Hold a concurrency slot only around the actual network call, not
             # retry backoff, so sync completions obey the same cap as async ones.
             with _sync_llm_semaphore():
@@ -235,11 +396,14 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return content, finish_reason
             return content
         except Exception as e:
+            is_429 = _is_rate_limit_error(e)
             llm_log(model, messages, error=str(e), attempt=i + 1, elapsed=time.time() - t0)
-            logger.warning("Retrying LLM completion (%d/%d)", i + 1, max_retries)
+            logger.warning("Retrying LLM completion (%d/%d)%s", i + 1, max_retries,
+                           " [rate limited]" if is_429 else "")
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
-                time.sleep(30)
+                delay = _extract_retry_delay(e, i)
+                time.sleep(delay)
             else:
                 # Degrade gracefully instead of aborting the whole index: a single
                 # persistently-failing call returns an empty result so callers can
@@ -258,11 +422,15 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
-    max_retries = 50
+    max_retries = 10
     messages = [{"role": "user", "content": prompt}]
+    limiter = get_rate_limiter()
     for i in range(max_retries):
         t0 = time.time()
         try:
+            # Optional RPM rate limiter (before acquiring concurrency slot)
+            if limiter:
+                await limiter.wait_async()
             # Hold a concurrency slot only around the actual network call — not
             # across retry backoff — so the cap counts real in-flight requests.
             async with _llm_semaphore():
@@ -275,11 +443,14 @@ async def llm_acompletion(model, prompt):
             llm_log(model, messages, response=content, attempt=i + 1, elapsed=time.time() - t0)
             return content
         except Exception as e:
+            is_429 = _is_rate_limit_error(e)
             llm_log(model, messages, error=str(e), attempt=i + 1, elapsed=time.time() - t0)
-            logger.warning("Retrying async LLM completion (%d/%d)", i + 1, max_retries)
+            logger.warning("Retrying async LLM completion (%d/%d)%s", i + 1, max_retries,
+                           " [rate limited]" if is_429 else "")
             logger.error(f"Error: {e}")
             if i < max_retries - 1:
-                await asyncio.sleep(30)
+                delay = _extract_retry_delay(e, i)
+                await asyncio.sleep(delay)
             else:
                 # Degrade gracefully (see llm_completion): return an empty result
                 # so the caller skips this step and the rest of the document still
