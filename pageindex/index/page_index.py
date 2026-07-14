@@ -49,8 +49,13 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     prompt = f"""
     You will be given the current section title and the current page_text.
     Your job is to check if the current section starts in the beginning of the given page_text.
-    If there are other contents before the current section title, then the current section does not start in the beginning of the given page_text.
-    If the current section title is the first content in the given page_text, then the current section starts in the beginning of the given page_text.
+    Ignore page headers, footers, page numbers, copyright lines, "Page X of Y" markers,
+    and any running header/footer text.
+    Section headings, sub-headings, and subsection titles ARE main body content — do NOT ignore them.
+    If there are other main body contents (including other section headings) before the current
+    section title, then the current section does not start in the beginning of the given page_text.
+    If the current section title is the first main body content in the given page_text, then the
+    current section starts in the beginning of the given page_text.
 
     Note: do fuzzy matching, ignore any space inconsistency in the page_text.
 
@@ -93,7 +98,14 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     for item in structure:
         if _valid_physical_index(item):
             page_text = page_list[item['physical_index'] - 1][0]
-            tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
+            # Pass structure prefix (e.g. "4.1.1") alongside title so the LLM
+            # can disambiguate sections with similar names on the same page
+            # (e.g. "4 Syntax (Normative)" vs "4.1.1 Syntax").
+            # Skip fallback prefixes (e.g. "_2") — they're for unnumbered
+            # headings and would only confuse the LLM.
+            struct = item.get('structure', '')
+            full_title = f"{struct} {item['title']}" if struct and not struct.startswith('_') else item['title']
+            tasks.append(check_title_appearance_in_start(full_title, page_text, model=model, logger=logger))
             valid_items.append(item)
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1248,27 +1260,11 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
 
     toc_with_page_number = add_preface_if_needed(toc_with_page_number)
     
-    # When TOC comes from PyMuPDF bookmarks, page numbers are authoritative —
-    # skip the expensive LLM-based title appearance check (1062 calls on USB4).
-    # Set appear_start='no' because in technical specs, section titles rarely
-    # appear at the very beginning of a page (page headers come first).
-    if toc_with_page_number and all(item.get('from_pdf_toc') for item in toc_with_page_number):
-        for item in toc_with_page_number:
-            item['appear_start'] = 'no'
-        if logger:
-            logger.info({'skipped_check_title_appearance': True, 'reason': 'TOC from PyMuPDF bookmarks', 'count': len(toc_with_page_number)})
-        progress_log(f'tree_parser: skipping check_title_appearance_in_start ({len(toc_with_page_number)} entries)')
-        print(f'skip check_title_appearance_in_start: TOC from PyMuPDF bookmarks ({len(toc_with_page_number)} entries)')
-    elif pdf_has_bookmarks:
-        # add_preface_if_needed may have inserted a Preface node without from_pdf_toc.
-        # Since the underlying TOC came from PyMuPDF, skip the check anyway.
-        for item in toc_with_page_number:
-            item['appear_start'] = 'no'
-        if logger:
-            logger.info({'skipped_check_title_appearance': True, 'reason': 'TOC from PyMuPDF bookmarks (with preface)', 'count': len(toc_with_page_number)})
-        print(f'skip check_title_appearance_in_start: TOC from PyMuPDF bookmarks ({len(toc_with_page_number)} entries)')
-    else:
-        toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
+    # Run LLM-based title appearance check for accurate end_index boundaries.
+    # Even for PyMuPDF bookmark TOCs, this correctly determines whether a
+    # section title appears at the start of its page — which affects how
+    # end_index is computed in post_processing().
+    toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
     
     # Filter out items with None physical_index before post_processings
     valid_toc_items = [item for item in toc_with_page_number if item.get('physical_index') is not None]
