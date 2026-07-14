@@ -51,8 +51,8 @@ def llm_log(model: str, messages: list, response: str = "",
             if error:
                 f.write(f"[{now}] ERROR attempt={attempt} elapsed={elapsed:.1f}s {error}\n")
             else:
-                prompt_preview = str(messages[-1].get("content",""))[:500].replace("\n"," ") if messages else ""
-                resp_preview = response[:500].replace(chr(10)," ")
+                prompt_preview = str(messages[-1].get("content","")).replace("\n"," ") if messages else ""
+                resp_preview = response.replace(chr(10)," ")
                 f.write(f"[{now}] REQUEST attempt={attempt} model={model} elapsed={elapsed:.1f}s prompt={sum(len(str(m.get('content',''))) for m in messages)}chars\n")
                 f.write(f"         {prompt_preview}\n")
                 f.write(f"[{now}] RESPONSE attempt={attempt} elapsed={elapsed:.1f}s ({len(response)} chars)\n")
@@ -589,7 +589,13 @@ def get_leaf_nodes(structure):
 
 
 async def generate_node_summary(node, model=None):
-    prompt = f"""You are given a part of a document, your task is to generate a single-paragraph summary of the partial document about what are main points covered in the partial document. State only WHAT topics are covered — do not explain them.
+    struct = node.get('structure', '')
+    display_title = f"{struct} {node['title']}" if struct and not struct.startswith('_') else node['title']
+    prompt = f"""You are given a part of a document, your task is to generate a single-paragraph summary of the partial document about what are main points covered in the partial document.
+
+The section title is: {display_title}.
+
+Focus on content related to this section title. Some surrounding text may belong to adjacent sections — ignore what isn't relevant to this section.
 
 Partial Document Text: {node['text']}
 
@@ -653,6 +659,7 @@ def list_to_tree(data):
             'title': item.get('title'),
             'start_index': item.get('start_index'),
             'end_index': item.get('end_index'),
+            'structure': item.get('structure'),   # preserve for summary prompts
             'nodes': []
         }
 
@@ -689,7 +696,7 @@ def post_processing(structure, end_physical_index):
     for i, item in enumerate(structure):
         item['start_index'] = item.get('physical_index')
         if i < len(structure) - 1:
-            if structure[i + 1].get('appear_start') == 'yes':
+            if structure[i + 1].get('appear_start') == 'yes' and structure[i + 1]['physical_index'] > item['physical_index']:
                 item['end_index'] = structure[i + 1]['physical_index']-1
             else:
                 item['end_index'] = structure[i + 1]['physical_index']
