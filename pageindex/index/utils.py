@@ -25,9 +25,13 @@ _current_doc_name: str = ""
 def set_doc_name(name: str) -> None:
     global _current_doc_name
     _current_doc_name = name
+    # 清空旧日志，确保 re-add 同一文档时从干净状态开始
+    log_dir = Path("logs")
+    for prefix in ("pageindex_progress", "pageindex_llm"):
+        (log_dir / f"{name}_{prefix}.log").unlink(missing_ok=True)
 
 def _log_suffix() -> str:
-    return f"_{_current_doc_name}" if _current_doc_name else ""
+    return f"{_current_doc_name}_" if _current_doc_name else ""
 
 def progress_log(msg: str) -> None:
     """Append a timestamped line to pageindex_progress[_doc].log."""
@@ -35,7 +39,7 @@ def progress_log(msg: str) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_dir = Path("logs")
         log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"pageindex_progress{_log_suffix()}.log", "a", encoding="utf-8") as f:
+        with open(log_dir / f"{_log_suffix()}pageindex_progress.log", "a", encoding="utf-8") as f:
             f.write(f"[{now}] {msg}\n")
     except Exception:
         pass
@@ -47,7 +51,7 @@ def llm_log(model: str, messages: list, response: str = "",
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_dir = Path("logs")
         log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"pageindex_llm{_log_suffix()}.log", "a", encoding="utf-8") as f:
+        with open(log_dir / f"{_log_suffix()}pageindex_llm.log", "a", encoding="utf-8") as f:
             if error:
                 f.write(f"[{now}] ERROR attempt={attempt} elapsed={elapsed:.1f}s {error}\n")
             else:
