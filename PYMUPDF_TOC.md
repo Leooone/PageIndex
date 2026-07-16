@@ -22,7 +22,7 @@ LLM 流程完全是冗余的。
 | `toc_transformer_from_pdf_toc()` | 用 PyMuPDF 直接读取 PDF 书签，替换 LLM 的 `toc_transformer()` |
 | `tree_parser()` 书签检测 | PDF 有书签时跳过 `check_toc()`、`find_toc_pages()` 等 LLM 检测 |
 | 跳过 `verify_toc` | 书签页码是权威的，无需 LLM 逐条验证 |
-| 跳过 `check_title_appearance_in_start` | 同上，节省 ~1000 次 LLM 调用 |
+| `check_title_appearance_in_start` | **仍通过 LLM 判断标题是否在页首**（影响 `post_processing` 的 `end_index` 计算）。书签只给页码不给位置，LLM 判断 `appear_start` 是准确获取章节页码范围的关键。最初设计跳过了此步，后续因 `end_index` 精度问题恢复 |
 | `process_large_node_recursively()` | 书签路径下跳过 LLM 重提取已有结构的节点 |
 
 ### 健壮性修复
