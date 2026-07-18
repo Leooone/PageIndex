@@ -79,11 +79,7 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
 async def check_title_appearance_in_start_concurrent(structure, page_list, model=None, logger=None):
     if logger:
         logger.info("Checking title appearance in start concurrently")
-    
-    # Mark items we can't check as 'no' up front: missing physical_index, or one
-    # out of range for page_list. An out-of-range index (the LLM can emit one)
-    # would otherwise raise IndexError below — during task-list construction,
-    # outside the gather's return_exceptions protection — and abort the build.
+
     def _valid_physical_index(item):
         idx = item.get('physical_index')
         return idx is not None and 1 <= idx <= len(page_list)
@@ -92,23 +88,32 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
         if not _valid_physical_index(item):
             item['appear_start'] = 'no'
 
-    # only for items with a valid, in-range physical_index
     tasks = []
     valid_items = []
     for item in structure:
         if _valid_physical_index(item):
             page_text = page_list[item['physical_index'] - 1][0]
-            # Pass structure prefix (e.g. "4.1.1") alongside title so the LLM
-            # can disambiguate sections with similar names on the same page
-            # (e.g. "4 Syntax (Normative)" vs "4.1.1 Syntax").
-            # Skip fallback prefixes (e.g. "_2") — they're for unnumbered
-            # headings and would only confuse the LLM.
             struct = item.get('structure', '')
             full_title = f"{struct} {item['title']}" if struct and not struct.startswith('_') else item['title']
             tasks.append(check_title_appearance_in_start(full_title, page_text, model=model, logger=logger))
             valid_items.append(item)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    total = len(tasks)
+    print(f"  Checking title positions for {total} sections...")
+    completed = [0]
+    progress_fmt = f"  Title check: {{}}/{total} ({{:3d}}%)"
+
+    async def _tracked(task):
+        try:
+            return await task
+        finally:
+            completed[0] += 1
+            pct = 100 * completed[0] // total
+            print("\r" + progress_fmt.format(completed[0], pct), end="", flush=True)
+
+    tracked_tasks = [_tracked(t) for t in tasks]
+    results = await asyncio.gather(*tracked_tasks, return_exceptions=True)
+    print()
     for item, result in zip(valid_items, results):
         if isinstance(result, Exception):
             if logger:

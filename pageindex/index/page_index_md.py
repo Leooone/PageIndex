@@ -15,10 +15,24 @@ async def get_node_summary(node, summary_token_threshold=200, model=None):
 
 async def generate_summaries_for_structure_md(structure, summary_token_threshold, model=None):
     nodes = structure_to_list(structure)
-    tasks = [get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model) for node in nodes]
+    total = len(nodes)
+    print(f"  Generating summaries for {total} nodes...")
+    completed = [0]
+    progress_fmt = f"  Summaries: {{}}/{total} ({{:3d}}%)"
+
+    async def _tracked(node):
+        try:
+            return await get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model)
+        finally:
+            completed[0] += 1
+            pct = 100 * completed[0] // total
+            print("\r" + progress_fmt.format(completed[0], pct), end="", flush=True)
+
+    tasks = [_tracked(node) for node in nodes]
     # return_exceptions=True: one node's summary failing must not abort
     # summarization for the whole document — fall back to its raw text.
     raw_summaries = await asyncio.gather(*tasks, return_exceptions=True)
+    print()
     summaries = [
         node.get('text', '') if isinstance(s, Exception) else s
         for node, s in zip(nodes, raw_summaries)

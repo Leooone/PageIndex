@@ -614,11 +614,23 @@ async def generate_summaries_for_structure(structure, model=None):
     total = len(nodes)
     progress_log(f"generate_summaries: starting {total} node summaries")
     print(f"  Generating summaries for {total} nodes...")
-    tasks = [generate_node_summary(node, model=model) for node in nodes]
+    completed = [0]
+    progress_fmt = f"  Summaries: {{}}/{total} ({{:3d}}%)"
+
+    async def _tracked(node):
+        try:
+            return await generate_node_summary(node, model=model)
+        finally:
+            completed[0] += 1
+            pct = 100 * completed[0] // total
+            print("\r" + progress_fmt.format(completed[0], pct), end="", flush=True)
+
+    tasks = [_tracked(node) for node in nodes]
     # return_exceptions=True: one node's summary failing (e.g. a transient LLM
     # error) must not abort summarization for the whole document — fall back
     # to the node's own raw text so retrieval still has something usable.
     raw_summaries = await asyncio.gather(*tasks, return_exceptions=True)
+    print()
     succeeded = sum(1 for s in raw_summaries if not isinstance(s, Exception))
     failed = total - succeeded
     progress_log(f"generate_summaries: done — {succeeded}/{total} ok, {failed} failed")

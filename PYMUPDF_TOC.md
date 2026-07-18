@@ -43,6 +43,10 @@ LLM 流程完全是冗余的。
 | `pageindex_progress.log` | 走了哪个分支、跳过哪些步骤 |
 | `pageindex_llm.log` | LLM 请求/响应（PyMuPDF 路径下为 0 字节） |
 
+**实时进度条：** `check_title_appearance_in_start_concurrent` 和
+`generate_summaries_for_structure` 阶段在控制台实时显示 `N/T (xx%)`，
+无需等待全部 LLM 调用结束。
+
 ### 适用范围
 
 - **有书签的 PDF：** 零 LLM TOC，只保留 summary 生成（可配置关闭）
